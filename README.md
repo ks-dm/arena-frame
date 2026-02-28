@@ -2,7 +2,7 @@
 
 An open-source e-ink photo frame that displays content from your [Are.na](https://are.na) channels. Built for Raspberry Pi with Pimoroni Inky Impression displays.
 
-![Arena Frame](https://are.na/images/arena-logo.svg)
+![Image]([https://are.na/images/arena-logo.svg](https://d2w9rnfcy7mm78.cloudfront.net/43072091/original_5bac5bdb616c690f1f34d8b42c0f9e5f.jpg?1769621675?bc=0))
 
 ## Features
 
