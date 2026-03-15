@@ -1,6 +1,6 @@
-content/
 state.json
+content/
 __pycache__/
 *.pyc
 .DS_Store
-*.log
+CLAUDE.md

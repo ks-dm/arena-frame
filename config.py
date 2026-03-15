@@ -14,7 +14,7 @@ AP_MODE_FLAG = Path("/tmp/force_ap_mode")
 FONT_DIR = Path("/home/pi")
 LOGO_FILE = Path("/etc/photoframe/arena.svg")
 
-ARENA_API = "https://api.are.na/v2"
+ARENA_API = "https://api.are.na/v3"
 
 CONFIG_DEFAULTS = {
     "channel_slug": "",

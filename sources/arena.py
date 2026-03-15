@@ -1,9 +1,11 @@
 """
 Are.na content source — fetches blocks from channels and downloads content.
 
-Are.na API returns blocks in "position" order:
-- position 1 (index 0) = OLDEST (first added to channel)
-- higher positions = NEWER (more recently added)
+Uses Are.na API v3. Key v3 behaviors:
+- Paginated responses return { "data": [...], "meta": { ... } }
+- Channel contents default to sort=position_desc (newest first on page 1)
+- sort=position_asc gives oldest first (needed for cycle mode full fetch)
+- Max 100 items per page
 
 Modes:
 - Live: Shows newest block on init, then watches for new additions
@@ -28,10 +30,11 @@ from config import (
 )
 from sources import ContentSource
 
-SUPPORTED_TYPES = {"Image", "Text", "Link", "Attachment", "Media", "File"}
+SUPPORTED_TYPES = {"Image", "Text", "Link", "Attachment", "Embed", "Media", "File"}
 MAX_RETRIES = 5
 RETRY_DELAY = 10
 CACHE_REFRESH_HOURS = 1
+PER_PAGE = 100
 
 
 # ---------------------------------------------------------------------------
@@ -49,13 +52,26 @@ def request_with_retry(method, url, **kwargs):
     for attempt in range(MAX_RETRIES):
         try:
             response = requests.request(method, url, timeout=120, **kwargs)
+
+            if response.status_code == 429:
+                reset = response.headers.get("X-RateLimit-Reset")
+                if reset:
+                    wait = max(1, int(float(reset)) - int(time.time()))
+                else:
+                    wait = RETRY_DELAY
+                print(f"Rate limited, waiting {wait}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                time.sleep(wait)
+                continue
+
             if response.status_code >= 500:
                 print(f"Server error {response.status_code} (attempt {attempt + 1}/{MAX_RETRIES})")
                 if attempt < MAX_RETRIES - 1:
                     print(f"Retrying in {RETRY_DELAY}s...")
                     time.sleep(RETRY_DELAY)
                     continue
+
             return response
+
         except (
             requests.exceptions.ConnectionError,
             requests.exceptions.Timeout,
@@ -69,6 +85,30 @@ def request_with_retry(method, url, **kwargs):
                 print("Max retries exceeded")
                 return None
     return None
+
+
+def _handle_api_error(response):
+    """Map HTTP status to error code. Returns None if status is 200."""
+    if response is None:
+        return ERROR_NETWORK
+    if response.status_code == 401:
+        return ERROR_UNAUTHORIZED
+    if response.status_code in (403, 404):
+        return ERROR_CHANNEL_NOT_FOUND
+    if response.status_code in (502, 503, 504):
+        return ERROR_SERVER
+    if response.status_code != 200:
+        return ERROR_NETWORK
+    return None
+
+
+def _parse_list_response(data):
+    """Parse v3 paginated list response. Returns (items, meta)."""
+    if "data" in data:
+        return data["data"], data.get("meta", {})
+    if "contents" in data:
+        return data["contents"], data
+    return [], {}
 
 
 # ---------------------------------------------------------------------------
@@ -102,48 +142,69 @@ def block_display_name(block: dict) -> str:
 
 
 def best_image_url(block: dict) -> str | None:
-    bclass = block.get("class")
     img_obj = block.get("image") or {}
 
-    if bclass == "Image" and isinstance(img_obj, dict):
-        original = img_obj.get("original")
-        if isinstance(original, dict) and original.get("url"):
-            return original["url"]
+    if not isinstance(img_obj, dict):
+        return None
 
-    if isinstance(img_obj, dict):
-        for key in ("display", "thumb", "large", "original"):
-            v = img_obj.get(key)
-            if isinstance(v, dict) and v.get("url"):
-                return v["url"]
+    # v3: image.src is the original URL
+    if img_obj.get("src"):
+        return img_obj["src"]
 
+    # v3: sized variants have src field (prefer large > medium > small > square)
+    for size in ("large", "medium", "small", "square"):
+        variant = img_obj.get(size)
+        if isinstance(variant, dict) and variant.get("src"):
+            return variant["src"]
+
+    # v2 fallback: image.original.url, image.display.url, etc.
+    for key in ("original", "display", "large", "thumb"):
+        v = img_obj.get(key)
+        if isinstance(v, dict) and v.get("url"):
+            return v["url"]
+
+    # Check attachment/file sub-objects (v2 style)
     for subkey in ("attachment", "file"):
         sub = block.get(subkey) or {}
         if isinstance(sub, dict):
-            img = sub.get("image") or {}
-            if isinstance(img, dict):
-                for key in ("display", "thumb", "large", "original"):
-                    v = img.get(key)
-                    if isinstance(v, dict) and v.get("url"):
-                        return v["url"]
+            sub_img = sub.get("image") or {}
+            if isinstance(sub_img, dict):
+                if sub_img.get("src"):
+                    return sub_img["src"]
+                for key in ("large", "medium", "small", "original", "display", "thumb"):
+                    v = sub_img.get(key)
+                    if isinstance(v, dict):
+                        if v.get("src"):
+                            return v["src"]
+                        if v.get("url"):
+                            return v["url"]
 
     return None
 
 
 def parse_block(block: dict) -> dict | None:
     """Parse API block response into our block format."""
-    bclass = block.get("class")
+    bclass = block.get("type") or block.get("class", "")
     if bclass not in SUPPORTED_TYPES:
         return None
+
+    # v3: position lives inside block.connection.position
+    connection = block.get("connection") or {}
+    position = connection.get("position", block.get("position", 0))
 
     block_info = {
         "id": block["id"],
         "class": bclass,
         "name": block_display_name(block),
-        "position": block.get("position", 0),
+        "position": position,
     }
 
     if bclass == "Text":
-        block_info["content"] = block.get("content", "")
+        # v3: content is { "markdown": "...", "html": "...", "plain": "..." }
+        content = block.get("content", "")
+        if isinstance(content, dict):
+            content = content.get("plain") or content.get("markdown") or ""
+        block_info["content"] = content
     else:
         block_info["image_url"] = best_image_url(block)
 
@@ -155,128 +216,91 @@ def parse_block(block: dict) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def fetch_channel_blocks(slug, token=None):
-    """Fetch all blocks from channel (paginated).
+    """Fetch all blocks from channel (paginated, oldest first).
 
-    Returns blocks in position order (index 0 = oldest, last = newest).
+    Uses sort=position_asc so index 0 = oldest, last = newest.
     Returns (blocks, error_code).
     """
     blocks = []
     page = 1
-    per_page = 20
     headers = get_headers(token)
 
     while True:
         url = f"{ARENA_API}/channels/{slug}/contents"
-        params = {"page": page, "per": per_page}
+        params = {"page": page, "per": PER_PAGE, "sort": "position_asc"}
         response = request_with_retry("GET", url, params=params, headers=headers)
 
-        if response is None:
-            print("Failed to connect to Are.na")
-            return None, ERROR_NETWORK
-
-        if response.status_code == 401:
-            print("Error: Unauthorized - check your access token")
-            return None, ERROR_UNAUTHORIZED
-        if response.status_code == 404:
-            print(f"Error: Channel '{slug}' not found - check spelling")
-            return None, ERROR_CHANNEL_NOT_FOUND
-        if response.status_code in (502, 503, 504):
-            print(f"Are.na servers temporarily unavailable ({response.status_code})")
-            return None, ERROR_SERVER
-        if response.status_code != 200:
-            print(f"Error fetching channel: {response.status_code}")
-            return None, ERROR_NETWORK
+        error = _handle_api_error(response)
+        if error:
+            if error == ERROR_UNAUTHORIZED:
+                print("Error: Unauthorized - check your access token")
+            elif error == ERROR_CHANNEL_NOT_FOUND:
+                print(f"Error: Channel '{slug}' not found - check spelling")
+            elif error == ERROR_SERVER:
+                print(f"Are.na servers temporarily unavailable")
+            else:
+                print(f"Error fetching channel: {response.status_code if response else 'no response'}")
+            return None, error
 
         data = response.json()
-        contents = data.get("contents", [])
-        for block in contents:
+        items, meta = _parse_list_response(data)
+
+        for block in items:
             parsed = parse_block(block)
             if parsed:
                 blocks.append(parsed)
 
-        if len(contents) < per_page:
+        has_more = meta.get("has_more_pages", False)
+        if not has_more and len(items) < PER_PAGE:
             break
-        time.sleep(1)
+        if not has_more:
+            break
+
+        time.sleep(0.5)
         page += 1
 
     print(f"Fetched {len(blocks)} blocks (oldest at index 0, newest at end)")
     return blocks, ERROR_NONE
 
 
-def _handle_api_error(response):
-    """Map HTTP status to error code. Returns None if status is 200."""
-    if response is None:
-        return ERROR_NETWORK
-    if response.status_code == 401:
-        return ERROR_UNAUTHORIZED
-    if response.status_code == 404:
-        return ERROR_CHANNEL_NOT_FOUND
-    if response.status_code in (502, 503, 504):
-        return ERROR_SERVER
-    if response.status_code != 200:
-        return ERROR_NETWORK
-    return None
+def fetch_newest_blocks(slug, token=None, per_page=PER_PAGE):
+    """Fetch the newest blocks from a channel (single API call).
 
-
-def fetch_newest_blocks(slug, token=None, per_page=50):
-    """Fetch the newest blocks from a channel.
-
-    The API paginates oldest-first, so this fetches page 1 to discover
-    the total size, then fetches the last page to get the newest blocks.
-    One API call for small channels, two for large ones.
-    Returns (blocks, error_code).
+    Uses v3 default sort (position_desc) so page 1 has the newest blocks.
+    Returns (blocks, meta, error_code). Blocks are newest-first.
     """
     headers = get_headers(token)
     url = f"{ARENA_API}/channels/{slug}/contents"
+    params = {"page": 1, "per": per_page, "sort": "position_desc"}
 
-    params = {"page": 1, "per": per_page}
     response = request_with_retry("GET", url, params=params, headers=headers)
 
     error = _handle_api_error(response)
     if error:
-        return None, error
+        return None, {}, error
 
     data = response.json()
-    contents = data.get("contents", [])
+    items, meta = _parse_list_response(data)
+    blocks = [p for b in items if (p := parse_block(b))]
 
-    if len(contents) < per_page:
-        blocks = [p for b in contents if (p := parse_block(b))]
-        print(f"Fetched {len(blocks)} blocks (single page)")
-        return blocks, ERROR_NONE
-
-    length = data.get("length", 0)
-    if length <= per_page:
-        blocks = [p for b in contents if (p := parse_block(b))]
-        return blocks, ERROR_NONE
-
-    last_page = (length + per_page - 1) // per_page
-    print(f"Channel has {length} blocks across {last_page} pages, fetching last page...")
-
-    params = {"page": last_page, "per": per_page}
-    response = request_with_retry("GET", url, params=params, headers=headers)
-
-    if response is None or response.status_code != 200:
-        blocks = [p for b in contents if (p := parse_block(b))]
-        print("Failed to fetch last page, falling back to page 1")
-        return blocks, ERROR_NONE
-
-    last_data = response.json()
-    blocks = [p for b in last_data.get("contents", []) if (p := parse_block(b))]
-    print(f"Fetched {len(blocks)} newest blocks from page {last_page}")
-    return blocks, ERROR_NONE
+    print(f"Fetched {len(blocks)} newest blocks (total: {meta.get('total_count', '?')})")
+    return blocks, meta, ERROR_NONE
 
 
 def get_channel_info(slug, token=None):
-    """Fetch user and channel display names from Are.na API."""
+    """Fetch owner and channel display names from Are.na API."""
     try:
         headers = get_headers(token)
         url = f"{ARENA_API}/channels/{slug}"
         response = requests.get(url, headers=headers, timeout=10)
         if response.status_code == 200:
             data = response.json()
+            # v3: owner.name; v2 fallback: user.full_name / user.username
+            owner = data.get("owner") or data.get("user") or {}
             user_name = (
-                data.get("user", {}).get("full_name")
-                or data.get("user", {}).get("username", "")
+                owner.get("name")
+                or owner.get("full_name")
+                or owner.get("username", "")
             )
             channel_name = data.get("title", slug)
             return user_name, channel_name
@@ -346,30 +370,28 @@ def should_refresh_cache(state):
 
 
 def _run_live_mode(slug, token, state):
-    """Watch for new blocks. First run shows newest; subsequent runs show new additions.
+    """Watch for new blocks added to a channel.
 
-    Uses fetch_channel_blocks (all pages) every time to reliably detect
-    new blocks regardless of channel size or API pagination order.
+    Uses sort=position_desc so page 1 always has the newest blocks.
+    Only needs a single API call per check.
     """
     print("Mode: Live")
 
-    blocks, error = fetch_channel_blocks(slug, token)
-    if error != ERROR_NONE:
-        write_error(error, f"Channel: {slug}")
-        return None, error
-    if not blocks:
-        print("No blocks in channel")
-        write_error(ERROR_CHANNEL_NOT_FOUND, "No blocks in channel")
-        return None, ERROR_CHANNEL_NOT_FOUND
-
-    known_ids = set(state.get("known_ids", []))
-
     if not state.get("initialized"):
+        blocks, meta, error = fetch_newest_blocks(slug, token)
+        if error != ERROR_NONE:
+            write_error(error, f"Channel: {slug}")
+            return None, error
+        if not blocks:
+            print("No blocks in channel")
+            write_error(ERROR_CHANNEL_NOT_FOUND, "No blocks in channel")
+            return None, ERROR_CHANNEL_NOT_FOUND
+
         print(f"Initializing live mode with {len(blocks)} blocks")
         state["known_ids"] = [b["id"] for b in blocks]
         state["initialized"] = True
 
-        newest_block = blocks[-1]
+        newest_block = blocks[0]
         print(f"Displaying newest: {newest_block['name']} (ID: {newest_block['id']}, pos: {newest_block.get('position')})")
 
         content_path = download_block(newest_block, token)
@@ -383,20 +405,31 @@ def _run_live_mode(slug, token, state):
         save_json(STATE_FILE, state)
         return None, ERROR_NETWORK
 
-    new_blocks = [b for b in blocks if b["id"] not in known_ids]
-
-    if not new_blocks:
-        print(f"No new blocks ({len(blocks)} total, {len(known_ids)} known)")
+    blocks, meta, error = fetch_newest_blocks(slug, token)
+    if error != ERROR_NONE:
+        write_error(error, f"Channel: {slug}")
+        return None, error
+    if not blocks:
+        print("No blocks returned")
         clear_error()
         return None, ERROR_NONE
 
-    new_block = new_blocks[-1]
-    print(f"New block found: {new_block['name']} (ID: {new_block['id']}, pos: {new_block.get('position')})")
+    known_ids = set(state.get("known_ids", []))
+    new_blocks = [b for b in blocks if b["id"] not in known_ids]
 
-    content_path = download_block(new_block, token)
+    if not new_blocks:
+        total = meta.get("total_count", len(blocks))
+        print(f"No new blocks ({total} total, {len(known_ids)} known)")
+        clear_error()
+        return None, ERROR_NONE
+
+    newest_new = new_blocks[0]
+    print(f"New block found: {newest_new['name']} (ID: {newest_new['id']}, pos: {newest_new.get('position')})")
+
+    content_path = download_block(newest_new, token)
     if content_path:
         state["known_ids"] = list(known_ids | set(b["id"] for b in new_blocks))
-        state["current_block_id"] = new_block["id"]
+        state["current_block_id"] = newest_new["id"]
         state["last_updated"] = datetime.now().isoformat()
         save_json(STATE_FILE, state)
         clear_error()
